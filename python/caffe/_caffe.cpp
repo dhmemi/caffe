@@ -561,7 +561,7 @@ BOOST_PYTHON_MODULE(_caffe) {
                         bp::init<shared_ptr<Solver<Dtype> >, const string&>())
 #ifdef USE_NCCL
     .def("new_uid", NCCL_New_Uid).staticmethod("new_uid")
-    .def("bcast", &NCCL<Dtype>::Broadcast)
+    .def("initNCCL", &NCCL<Dtype>::InitNCCL)
 #endif
     /* NOLINT_NEXT_LINE(whitespace/semicolon) */
   ;

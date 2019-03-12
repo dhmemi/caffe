@@ -17,6 +17,7 @@
 #include "caffe/syncedmem.hpp"
 #include "caffe/util/blocking_queue.hpp"
 #include "caffe/util/nccl.hpp"
+#include "caffe/util/mpi.hpp"
 
 namespace caffe {
 
@@ -68,32 +69,19 @@ class NCCL : public GPUParams<Dtype>,
              public Solver<Dtype>::Callback,
              public Net<Dtype>::Callback {
  public:
-  /**
-   * Single process version.
-   */
-  explicit NCCL(shared_ptr<Solver<Dtype> > solver);
-  /**
-   * In multi-process settings, first create a NCCL id (new_uid), then
-   * pass it to each process to create connected instances.
-   */
-  NCCL(shared_ptr<Solver<Dtype> > solver, const string& uid);
+  explicit NCCL(shared_ptr<Solver<Dtype> > solver, const string& uid = string());
   ~NCCL();
 
   boost::barrier* barrier();
   void set_barrier(boost::barrier* value);
-
-  /**
-   * In single process settings, create instances without uids and
-   * call this to connect them.
-   */
-  static void InitSingleProcess(vector<NCCL<Dtype>*>* nccls);
+  void set_nccl_uid(const ncclUniqueId& id);
 
   static string new_uid();
 
   /**
    * Broadcast weights from rank 0 other solvers.
    */
-  void Broadcast();
+  void InitNCCL();
 
   /**
    * Single process multi-GPU.
@@ -105,6 +93,15 @@ class NCCL : public GPUParams<Dtype>,
   void on_start() {}
   void run(int layer);  // Net callback
   void on_gradients_ready();
+
+  /**
+   * in single thread, mpi should be inited to reduce total_gpu_size_ and nccl_id_
+   */
+  void InitMPI(int local_gpu_size = 0);
+
+  int local_start_rank_;
+  vector<int> node_gpu_sizes_;
+  ncclUniqueId nccl_uid_;
 
   ncclComm_t comm_;
   cudaStream_t stream_;

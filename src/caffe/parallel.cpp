@@ -114,25 +114,14 @@ static int getDevice() {
 }
 
 template<typename Dtype>
-NCCL<Dtype>::NCCL(shared_ptr<Solver<Dtype> > solver)
-  : GPUParams<Dtype>(solver, getDevice()),
-    comm_(), solver_(solver), barrier_() {
-  this->Configure(solver.get());
-  Init();
-}
-
-template<typename Dtype>
 NCCL<Dtype>::NCCL(shared_ptr<Solver<Dtype> > solver, const string& uid)
   : GPUParams<Dtype>(solver, getDevice()),
     solver_(solver), barrier_() {
   this->Configure(solver.get());
-  Caffe::set_multiprocess(true);
-  ncclUniqueId nccl_uid;
-  memcpy(&nccl_uid, &uid[0], NCCL_UNIQUE_ID_BYTES);  // NOLINT(caffe/alt_fn)
-  NCCL_CHECK(ncclCommInitRank(&comm_,
-                              Caffe::solver_count(),
-                              nccl_uid,
-                              Caffe::solver_rank()));
+  if(!uid.empty()) {
+    Caffe::set_multiprocess(true);
+    memcpy(&nccl_uid_, &uid[0], NCCL_UNIQUE_ID_BYTES);  // NOLINT(caffe/alt_fn)
+  }
   Init();
 }
 
@@ -163,16 +152,8 @@ void NCCL<Dtype>::set_barrier(boost::barrier* value) {
 }
 
 template<typename Dtype>
-void NCCL<Dtype>::InitSingleProcess(vector<NCCL<Dtype>*>* nccls) {
-  ncclComm_t* comms = new ncclComm_t[nccls->size()];
-  int* gpu_list = new int[nccls->size()];
-  for (int i = 0; i < nccls->size(); ++i) {
-    gpu_list[i] = (*nccls)[i]->solver_->param().device_id();
-  }
-  NCCL_CHECK(ncclCommInitAll(comms, static_cast<int>(nccls->size()), gpu_list));
-  for (int i = 0; i < nccls->size(); ++i) {
-    (*nccls)[i]->comm_ = comms[i];
-  }
+void NCCL<Dtype>::set_nccl_uid(const ncclUniqueId& id) {
+  nccl_uid_ = id;
 }
 
 template<typename Dtype>
@@ -185,11 +166,42 @@ string NCCL<Dtype>::new_uid() {
   return uid;
 }
 
+template <typename Dtype>
+void NCCL<Dtype>::InitMPI(int local_gpu_size){
+  int mpi_rank;
+  int mpi_size;
+  int provided;
+  MPI_CHECK(MPI_Init_thread(NULL, NULL, MPI_THREAD_FUNNELED, &provided));
+  MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpi_size));
+  MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank));
+  node_gpu_sizes_.resize(size_t(mpi_size));
+
+  int local_solver_count = local_gpu_size;
+  MPI_CHECK(MPI_Allgather(&local_solver_count, 1, MPI_INT, &node_gpu_sizes_[0], 1, MPI_INT, MPI_COMM_WORLD));
+  local_start_rank_ = 0;
+  for(auto i = 0; i < mpi_rank; i++){
+      local_start_rank_ += node_gpu_sizes_[i];
+  }
+  int total_gpu_size = local_start_rank_;
+  for(auto i = mpi_rank; i < mpi_size; i++){
+      total_gpu_size += node_gpu_sizes_[i];
+  }
+  //reset solver count to make sure solver_count == total_gpu_size
+  Caffe::set_solver_count(total_gpu_size);
+
+  if(0 == mpi_rank) {
+      NCCL_CHECK(ncclGetUniqueId(&nccl_uid_));
+  }
+  MPI_CHECK(MPI_Bcast((void *)&nccl_uid_, sizeof(nccl_uid_), MPI_BYTE, 0, MPI_COMM_WORLD));
+  MPI_CHECK(MPI_Finalize());
+}
+
 template<typename Dtype>
-void NCCL<Dtype>::Broadcast() {
+void NCCL<Dtype>::InitNCCL() {
   if (barrier_) {  // NULL in multi process case
     barrier_->wait();
   }
+  NCCL_CHECK(ncclCommInitRank(&comm_, Caffe::solver_count(), nccl_uid_, Caffe::solver_rank()));
   NCCL_CHECK(ncclBcast(data_, static_cast<int>(size_),
                        nccl::dataType<Dtype>::type, 0,
                        comm_, cudaStreamDefault));
@@ -259,15 +271,15 @@ template<typename Dtype>
 class Worker : public InternalThread {
  public:
   explicit Worker(shared_ptr<Solver<Dtype> > rank0, int device,
-                  boost::barrier* barrier, vector<NCCL<Dtype>*>* nccls,
-                  const char* restore)
+                  boost::barrier* barrier, const ncclUniqueId& uid,
+                  vector<NCCL<Dtype>*>* nccls, const char* restore)
     : rank0_(rank0), device_(device), barrier_(barrier),
-      nccls_(nccls), restore_(restore) {
+      uid_(uid), nccls_(nccls), restore_(restore) {
   }
   virtual ~Worker() {}
 
  protected:
-  void InternalThreadEntry() {
+  void InternalThreadEntry() override{
     // Create solver and install callbacks
     SolverParameter param(rank0_->param());
     param.set_device_id(device_);
@@ -287,6 +299,7 @@ class Worker : public InternalThread {
     }
     NCCL<Dtype> nccl(s);
     nccl.set_barrier(barrier_);
+    nccl.set_nccl_uid(uid_);
     s->add_callback(&nccl);
     if (s->param().layer_wise_reduce()) {
       s->net()->add_after_backward(&nccl);
@@ -294,10 +307,8 @@ class Worker : public InternalThread {
     (*nccls_)[Caffe::solver_rank()] = &nccl;
     // Wait for other threads
     barrier_->wait();
-    // Wait for NCCL init
-    barrier_->wait();
-    // Broadcast rank 0 state
-    nccl.Broadcast();
+    // init nccl rank and Broadcast rank 0 state
+    nccl.InitNCCL();
     // Solve
     s->Step(param.max_iter() - s->iter());
     barrier_->wait();
@@ -320,26 +331,30 @@ class Worker : public InternalThread {
   shared_ptr<Solver<Dtype> > rank0_;
   int device_;
   boost::barrier* barrier_;
+  ncclUniqueId uid_;
   vector<NCCL<Dtype>*>* nccls_;
   const char* restore_;
 };
 
 template<typename Dtype>
 void NCCL<Dtype>::Run(const vector<int>& gpus, const char* restore) {
+  //broadcast nccl_uid and gpu info through mpi
+  InitMPI(int(gpus.size()));
+
   boost::barrier barrier(static_cast<int>(gpus.size()));
   vector<NCCL<Dtype>*> nccls(gpus.size());
   // Create workers
   vector<shared_ptr<Worker<Dtype> > > workers(gpus.size());
   for (int i = 1; i < gpus.size(); ++i) {
     CUDA_CHECK(cudaSetDevice(gpus[i]));
-    Caffe::set_solver_rank(i);
+    Caffe::set_solver_rank(local_start_rank_ + i);
     Worker<Dtype>* w = new Worker<Dtype>(solver_, gpus[i], &barrier,
-                                         &nccls, restore);
+                                         nccl_uid_, &nccls, restore);
     w->StartInternalThread();
     workers[i].reset(w);
   }
   CUDA_CHECK(cudaSetDevice(gpus[0]));
-  Caffe::set_solver_rank(0);
+  Caffe::set_solver_rank(local_start_rank_ + 0);
   barrier_ = &barrier;
   solver_->add_callback(this);
   if (solver_->param().layer_wise_reduce()) {
@@ -348,12 +363,13 @@ void NCCL<Dtype>::Run(const vector<int>& gpus, const char* restore) {
   nccls[0] = this;
   // Wait for workers
   barrier.wait();
-  // Init NCCL
-  InitSingleProcess(&nccls);
-  barrier.wait();
   // Run first solver on current thread
-  Broadcast();
-  solver_->Solve();
+  InitNCCL();
+  if(Caffe::root_solver()){
+      solver_->Solve();
+  }else{
+      solver_->Step(solver_->param().max_iter() - solver_->iter());
+  }
   barrier.wait();  // Hangs without it when running tests
   // Wait for shutdown
   for (int i = 1; i < gpus.size(); ++i) {

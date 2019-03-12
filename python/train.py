@@ -74,7 +74,7 @@ def solve(proto, snapshot, gpus, timing, uid, rank):
         solver.restore(snapshot)
 
     nccl = caffe.NCCL(solver, uid)
-    nccl.bcast()
+    nccl.initNCCL()
 
     if timing and rank == 0:
         time(solver, nccl)
